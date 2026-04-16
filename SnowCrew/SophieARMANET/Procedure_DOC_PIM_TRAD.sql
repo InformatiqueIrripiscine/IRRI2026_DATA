@@ -300,6 +300,9 @@ def main(session):
     session.sql(f"ALTER STAGE AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD REFRESH").collect()
 
     session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.ZIPS_TRAITES;").collect()
+    session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.COPIES_A_FAIRE;").collect()
+    session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES;").collect()
+
 
 
     return f''Analyse terminée: {nb_new_zips} nouveaux ZIPs, {nb_docs} documents analysés, {nb_copies} copies créées dans le dossier {today_folder}''
