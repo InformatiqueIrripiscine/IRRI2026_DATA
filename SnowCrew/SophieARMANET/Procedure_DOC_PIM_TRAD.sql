@@ -276,9 +276,9 @@ def main(session):
                 || lc.lang_code 
                 || CASE
                      WHEN REGEXP_LIKE(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''.*[_\\-][0-9]\\.[^.]+$'')
-                    THEN ''_'' || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''.*[_\\-][0-9]\\.[^.]+$'')) - 1), ''_'', ''-'') || REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''.*[_\\-][0-9]\\.[^.]+$'')
+                    THEN ''_'' || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''[_\\-][0-9]\\.[^.]+$'')) - 1), ''_'', ''-'') || LOWER(REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''[_\\-][0-9]\\.[^.]+$''))
                      ELSE ''_''
-                || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$'')) - 1), ''_'', ''-'') || ''_1'' || REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$'')
+                || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$'')) - 1), ''_'', ''-'') || ''_1'' || LOWER(REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$''))
                    END
             AS target_file,
             lc.lang_code,
