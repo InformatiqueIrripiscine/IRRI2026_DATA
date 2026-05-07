@@ -79,3 +79,5 @@ LEFT JOIN BRONZE.AKENEO_OPTIONS_ATTRIBUTES_RAW_DATA o
     ON o.RAW_DATA:attribute::STRING = f.attribute_code
     AND o.RAW_DATA:code::STRING = f.cleaned_attribute_value
 ;
+
+SELECT * FROM ARTICLE_COMPLET_INFO;
