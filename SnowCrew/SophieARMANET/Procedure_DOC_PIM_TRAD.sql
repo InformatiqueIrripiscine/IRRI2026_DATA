@@ -27,10 +27,11 @@ def extract_pdfs_from_zips(session):
     new_zips = [row[''RELATIVE_PATH''] for row in all_files if row[''RELATIVE_PATH''] not in done_set]
 
     if not new_zips:
-        return [], 0, {}
+        return [], 0, {}, {}
 
     extracted_pdfs = []
     file_type_map = {}
+    file_code_map = {}
     zip_stats = []  # (zip_path, type_zip, nb_pdfs) pour INSERT batch
     for zip_path in new_zips:
         full_path = f''{STAGE}/{zip_path}''
@@ -55,7 +56,7 @@ def extract_pdfs_from_zips(session):
                                 entry_type = parts[i + 1]
                                 break
                         if entry_type is None and len(parts) > 2:
-                            candidate = parts[-2]
+                            candidate = parts[-3]
                             if not re.match(r''^\\d+$'', candidate):
                                 entry_type = candidate
                         if type_zip is None and entry_type:
@@ -64,13 +65,7 @@ def extract_pdfs_from_zips(session):
 # Replace les espaces et accents par des _ enfin d être safe sur le nom, recupere tous les lettre, chiffre ,_ , - et . dans la regex et le nom du pdf seul via .basename()
 
                         safe_name = re.sub(r''[^\\w.\\-()]'', ''_'', os.path.basename(pdf_name))
-                        code_match = re.match(r''^([0-9]{6})'', safe_name)
-                        if not code_match:
-                             for part in parts:
-                                 m = re.match(r''^([0-9]{6})'', part)
-                                 if m:
-                                     safe_name = m.group(1) + ''_'' + safe_name
-                                     break
+                        code_article = parts[-3] if len(parts) >= 3 else None
 
         # Streaming direct zip -> stage (zéro disque, zéro pic mémoire)
                         try:
@@ -83,6 +78,8 @@ def extract_pdfs_from_zips(session):
                             extracted_pdfs.append(safe_name)
                             if entry_type:
                                 file_type_map[safe_name] = entry_type
+                            if code_article:
+                                file_code_map[safe_name] = code_article
                             nb_pdfs += 1
                         except Exception:
                             continue
@@ -104,14 +101,14 @@ def extract_pdfs_from_zips(session):
 # Une fois tout insérer dans le stage on refresh le stage (collect execute une requete sql)   
 
     session.sql(f"ALTER STAGE AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD REFRESH").collect()
-    return extracted_pdfs, len(new_zips), file_type_map
+    return extracted_pdfs, len(new_zips), file_type_map, file_code_map
 
 
 def main(session):
     from datetime import date
     today_folder = date.today().strftime(''%Y%m%d'')
 
-    extracted_pdfs, nb_new_zips, file_type_map = extract_pdfs_from_zips(session)
+    extracted_pdfs, nb_new_zips, file_type_map, file_code_map = extract_pdfs_from_zips(session)
 
 # file_type_name ressemble à : "clé": "safe_name" ; "valeur" : "type_zip", la requête permet d unifier des select avec le file_name reprenant la clé et le file_typ la valur pour le mettre dans ue table temporaire
     if file_type_map:
@@ -126,6 +123,21 @@ def main(session):
         session.sql("""
             CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_TYPE_MAP (
                 FILE_NAME VARCHAR, FILE_TYPE VARCHAR
+            )
+        """).collect()
+
+    if file_code_map:
+        code_map_values = " UNION ALL ".join(
+            [f"SELECT ''{k}'' AS file_name, ''{v}'' AS code_article" for k, v in file_code_map.items()]
+        )
+        session.sql(f"""
+            CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP AS
+            {code_map_values}
+        """).collect()
+    else:
+        session.sql("""
+            CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP (
+                FILE_NAME VARCHAR, CODE_ARTICLE VARCHAR
             )
         """).collect()
 
@@ -178,9 +190,10 @@ def main(session):
             doc_contents AS (
                 SELECT
                     f.file_name AS document_name,
-                    REGEXP_SUBSTR(f.file_name, ''([0-9]{{6}})'', 1, 1, ''e'') AS code_article,
+                    fcm.code_article AS code_article,
                     SNOWFLAKE.CORTEX.PARSE_DOCUMENT(''{STAGE}'', f.file_name, {{''mode'': ''OCR''}}):content::VARCHAR AS content
                 FROM all_files f
+                LEFT JOIN AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP fcm ON f.file_name = fcm.file_name
             ),
             lang_analysis AS (
                 SELECT
