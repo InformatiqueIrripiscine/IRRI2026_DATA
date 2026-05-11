@@ -27,10 +27,12 @@ def extract_pdfs_from_zips(session):
     new_zips = [row[''RELATIVE_PATH''] for row in all_files if row[''RELATIVE_PATH''] not in done_set]
 
     if not new_zips:
-        return ''Aucun nouveau ZIP à traiter''
+        return [], 0, {}, {}
 
     extracted_pdfs = []
     file_type_map = {}
+    file_code_map = {}
+    zip_stats = []  # (zip_path, type_zip, nb_pdfs) pour INSERT batch
     for zip_path in new_zips:
         full_path = f''{STAGE}/{zip_path}''
         nb_pdfs = 0
@@ -45,6 +47,8 @@ def extract_pdfs_from_zips(session):
 # Split de tous le chemin par / et retourne un tableau, utilise l index pour détecter le sku, récupérer le type de dcuments et break dès qu un est trouvé
 
                     for pdf_name in pdf_entries:
+                        original_name = pdf_name
+                        pdf_name = pdf_name.replace(''\\\\'', ''/'')
                         parts = pdf_name.split(''/'')
                         entry_type = None
                         for i, part in enumerate(parts):
@@ -52,7 +56,7 @@ def extract_pdfs_from_zips(session):
                                 entry_type = parts[i + 1]
                                 break
                         if entry_type is None and len(parts) > 2:
-                            candidate = parts[-2]
+                            candidate = parts[-3]
                             if not re.match(r''^\\d+$'', candidate):
                                 entry_type = candidate
                         if type_zip is None and entry_type:
@@ -60,49 +64,51 @@ def extract_pdfs_from_zips(session):
 
 # Replace les espaces et accents par des _ enfin d être safe sur le nom, recupere tous les lettre, chiffre ,_ , - et . dans la regex et le nom du pdf seul via .basename()
 
-                        safe_name = re.sub(r''[^\\w.\\-]'', ''_'', os.path.basename(pdf_name))
-                        code_match = re.match(r''^(\\d+)'', safe_name)
-                        if not code_match:
-                             for part in parts:
-                                 m = re.match(r''^(\\d+)'', part)
-                                 if m:
-                                     safe_name = m.group(1) + ''_'' + safe_name
-                                     break
-                        tmp_path = f''/tmp/{safe_name}''
+                        safe_name = re.sub(r''[^\\w.\\-()]'', ''_'', os.path.basename(pdf_name))
+                        code_article = parts[-3] if len(parts) >= 3 else None
 
-        # Ajout dans tmp_path de tous les pdf_name récupérés dans le zip, zf.read décompresse et lit le contenu binaire pour écrire le pdf avec ces octets (ces données)
-                        with open(tmp_path, ''wb'') as out:
-                            out.write(zf.read(pdf_name))
-                            
-        # Méthode Snowflake pour uploader des fichiers dans un stage
-                        session.file.put(
-                            tmp_path, STAGE,
-                            auto_compress=False, overwrite=True
-                        )
-                        extracted_pdfs.append(safe_name)
-                        if entry_type:
-                            file_type_map[safe_name] = entry_type
-                        nb_pdfs += 1
+        # Streaming direct zip -> stage (zéro disque, zéro pic mémoire)
+                        try:
+                            with zf.open(original_name) as pdf_stream:
+                                session.file.put_stream(
+                                    pdf_stream,
+                                    f"{STAGE}/{safe_name}",
+                                    auto_compress=False, overwrite=True
+                                )
+                            extracted_pdfs.append(safe_name)
+                            if entry_type:
+                                file_type_map[safe_name] = entry_type
+                            if code_article:
+                                file_code_map[safe_name] = code_article
+                            nb_pdfs += 1
+                        except Exception:
+                            continue
         except Exception as e:
             pass
 
-        type_zip_sql = f"''{type_zip}''" if type_zip else "NULL"
+        zip_stats.append((zip_path, type_zip, nb_pdfs))
+
+# INSERT batch unique pour tous les zips traités (1 round-trip SQL au lieu de N)
+    if zip_stats:
+        values_sql = ", ".join([
+            f"(''{zp.replace(chr(39), chr(39)+chr(39))}'', " + (f"''{tz}''" if tz else "NULL") + f", {nb})"
+            for zp, tz, nb in zip_stats
+        ])
         session.sql(
-            f"INSERT INTO AREA_SOPHIE.PUBLIC.ZIPS_TRAITES (ZIP_NAME, TYPE_ZIP, NB_PDFS_EXTRAITS) "
-            f"VALUES (''{zip_path}'', {type_zip_sql}, {nb_pdfs})"
+            f"INSERT INTO AREA_SOPHIE.PUBLIC.ZIPS_TRAITES (ZIP_NAME, TYPE_ZIP, NB_PDFS_EXTRAITS) VALUES {values_sql}"
         ).collect()
 
 # Une fois tout insérer dans le stage on refresh le stage (collect execute une requete sql)   
 
     session.sql(f"ALTER STAGE AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD REFRESH").collect()
-    return extracted_pdfs, len(new_zips), file_type_map
+    return extracted_pdfs, len(new_zips), file_type_map, file_code_map
 
 
 def main(session):
     from datetime import date
     today_folder = date.today().strftime(''%Y%m%d'')
 
-    extracted_pdfs, nb_new_zips, file_type_map = extract_pdfs_from_zips(session)
+    extracted_pdfs, nb_new_zips, file_type_map, file_code_map = extract_pdfs_from_zips(session)
 
 # file_type_name ressemble à : "clé": "safe_name" ; "valeur" : "type_zip", la requête permet d unifier des select avec le file_name reprenant la clé et le file_typ la valur pour le mettre dans ue table temporaire
     if file_type_map:
@@ -117,6 +123,21 @@ def main(session):
         session.sql("""
             CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_TYPE_MAP (
                 FILE_NAME VARCHAR, FILE_TYPE VARCHAR
+            )
+        """).collect()
+
+    if file_code_map:
+        code_map_values = " UNION ALL ".join(
+            [f"SELECT ''{k}'' AS file_name, ''{v}'' AS code_article" for k, v in file_code_map.items()]
+        )
+        session.sql(f"""
+            CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP AS
+            {code_map_values}
+        """).collect()
+    else:
+        session.sql("""
+            CREATE OR REPLACE TEMPORARY TABLE AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP (
+                FILE_NAME VARCHAR, CODE_ARTICLE VARCHAR
             )
         """).collect()
 
@@ -145,69 +166,76 @@ def main(session):
     if new_files[0][''CNT''] == 0:
         return ''Aucun nouveau fichier détecté''
 
-    session.sql(f"""
-        INSERT INTO AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES
-        WITH stage_files AS (
-            SELECT RELATIVE_PATH AS file_name
-            FROM DIRECTORY(''{STAGE}'')
-            WHERE (RELATIVE_PATH ILIKE ''%.pdf'' OR RELATIVE_PATH ILIKE ''%.png'' OR RELATIVE_PATH ILIKE ''%.jpg'')
-              AND NOT REGEXP_LIKE(RELATIVE_PATH, ''^[0-9]{{8}}/.*'')
-              AND NOT RELATIVE_PATH ILIKE ''%.zip''
-              AND RELATIVE_PATH NOT IN (
-                  SELECT DOCUMENT_NAME
-                  FROM AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES
-              )
-        ),
-        doc_contents AS (
-            SELECT
-                file_name AS document_name,
-                REGEXP_SUBSTR(file_name, ''^(\\d+)'', 1, 1, ''e'') AS code_article,
-                SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
-                    ''{STAGE}'',
-                    file_name,
-                    {{''mode'': ''OCR''}}
-                ):content::VARCHAR AS content
-            FROM stage_files
-        ),
-        lang_analysis AS (
-            SELECT
-                document_name,
-                code_article,
-                content,
-                REGEXP_COUNT(content, ''[А-Яа-яЁё]'') > 50 AS russian,
-                SNOWFLAKE.CORTEX.COMPLETE(
-                    ''llama3.1-70b'',
-                    ''Analyze this text and return ONLY a valid JSON: {{"english":true,"french":false,"spanish":false,"italian":false,"german":false,"portuguese":false,"turkish":false,"czech":false,"dutch":false,"polish":false,"chinese":false,"japanese":false,"arabic":false}}. Set true for languages present in the text. Text sample: '' || LEFT(content, 30000) || '' ... [end sample, also check middle]: '' || SUBSTR(content, GREATEST(1, LENGTH(content)/2 - 5000), 10000)
-                ) AS lang_json
-            FROM doc_contents
-        ),
-        parsed AS (
-            SELECT
-                document_name,
-                code_article,
-                russian,
-                TRY_PARSE_JSON(REGEXP_SUBSTR(lang_json, ''\\\\\\\\{{[^}}]+\\\\\\\\}}'')) AS js
-            FROM lang_analysis
-        )
-        SELECT
-            document_name,
-            code_article,
-            COALESCE(js:english::BOOLEAN, FALSE) AS english,
-            COALESCE(js:french::BOOLEAN, FALSE) AS french,
-            COALESCE(js:spanish::BOOLEAN, FALSE) AS spanish,
-            COALESCE(js:italian::BOOLEAN, FALSE) AS italian,
-            COALESCE(js:german::BOOLEAN, FALSE) AS german,
-            COALESCE(js:portuguese::BOOLEAN, FALSE) AS portuguese,
-            COALESCE(js:turkish::BOOLEAN, FALSE) AS turkish,
-            COALESCE(js:czech::BOOLEAN, FALSE) AS czech,
-            COALESCE(js:dutch::BOOLEAN, FALSE) AS dutch,
-            COALESCE(js:polish::BOOLEAN, FALSE) AS polish,
-            COALESCE(js:chinese::BOOLEAN, FALSE) AS chinese,
-            COALESCE(js:japanese::BOOLEAN, FALSE) AS japanese,
-            COALESCE(js:arabic::BOOLEAN, FALSE) AS arabic,
-            russian
-        FROM parsed
+    new_files_list = session.sql(f"""
+        SELECT RELATIVE_PATH AS file_name
+        FROM DIRECTORY(''{STAGE}'')
+        WHERE (RELATIVE_PATH ILIKE ''%.pdf'' OR RELATIVE_PATH ILIKE ''%.png'' OR RELATIVE_PATH ILIKE ''%.jpg'')
+          AND NOT REGEXP_LIKE(RELATIVE_PATH, ''^[0-9]{{8}}/.*'')
+          AND NOT RELATIVE_PATH ILIKE ''%.zip''
+          AND RELATIVE_PATH NOT IN (
+              SELECT DOCUMENT_NAME FROM AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES
+          )
     """).collect()
+
+    skipped_files = []
+    file_list_sql = " UNION ALL ".join([
+        f"SELECT ''{row[''FILE_NAME'']}'' AS file_name"
+        for row in new_files_list
+    ])
+    
+    try:
+        session.sql(f"""
+            INSERT INTO AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES
+            WITH all_files AS ({file_list_sql}),
+            doc_contents AS (
+                SELECT
+                    f.file_name AS document_name,
+                    fcm.code_article AS code_article,
+                    SNOWFLAKE.CORTEX.PARSE_DOCUMENT(''{STAGE}'', f.file_name, {{''mode'': ''OCR''}}):content::VARCHAR AS content
+                FROM all_files f
+                LEFT JOIN AREA_SOPHIE.PUBLIC.TMP_FILE_CODE_MAP fcm ON f.file_name = fcm.file_name
+            ),
+            lang_analysis AS (
+                SELECT
+                    document_name,
+                    code_article,
+                    content,
+                    REGEXP_COUNT(content, ''[А-Яа-яЁё]'') > 50 AS russian,
+                    SNOWFLAKE.CORTEX.COMPLETE(
+                        ''llama3.1-70b'',
+                        ''Analyze this text and return ONLY a valid JSON: {{"english":true,"french":false,"spanish":false,"italian":false,"german":false,"portuguese":false,"turkish":false,"czech":false,"dutch":false,"polish":false,"chinese":false,"japanese":false,"arabic":false}}. Set true for languages present in the text. Text sample: '' || LEFT(content, 30000) || '' ... [end sample, also check middle]: '' || SUBSTR(content, GREATEST(1, LENGTH(content)/2 - 5000), 10000)
+                    ) AS lang_json
+                FROM doc_contents
+            ),
+            parsed AS (
+                SELECT
+                    document_name,
+                    code_article,
+                    russian,
+                    TRY_PARSE_JSON(REGEXP_SUBSTR(lang_json, ''\\\\\\\\{{[^}}]+\\\\\\\\}}'')) AS js
+                FROM lang_analysis
+            )
+            SELECT
+                document_name,
+                code_article,
+                COALESCE(js:english::BOOLEAN, FALSE),
+                COALESCE(js:french::BOOLEAN, FALSE),
+                COALESCE(js:spanish::BOOLEAN, FALSE),
+                COALESCE(js:italian::BOOLEAN, FALSE),
+                COALESCE(js:german::BOOLEAN, FALSE),
+                COALESCE(js:portuguese::BOOLEAN, FALSE),
+                COALESCE(js:turkish::BOOLEAN, FALSE),
+                COALESCE(js:czech::BOOLEAN, FALSE),
+                COALESCE(js:dutch::BOOLEAN, FALSE),
+                COALESCE(js:polish::BOOLEAN, FALSE),
+                COALESCE(js:chinese::BOOLEAN, FALSE),
+                COALESCE(js:japanese::BOOLEAN, FALSE),
+                COALESCE(js:arabic::BOOLEAN, FALSE),
+                russian
+            FROM parsed
+        """).collect()
+    except Exception as e:
+        skipped_files.append(("batch", str(e)))
 
     nb_docs_row = session.sql("SELECT COUNT(*) AS cnt FROM AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES").collect()
     nb_docs = nb_docs_row[0][''CNT'']
@@ -250,10 +278,21 @@ def main(session):
         SELECT
             u.document_name AS source_file,
             ''{today_folder}/'' || COALESCE(ftm.file_type, ''autres'') || ''/''
-                || REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')
-                || SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1, 1)
-                || lc.lang_code
-                || SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)
+                || CASE
+                     WHEN REGEXP_LIKE(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e''), ''^[0-9]{{6,}}'')
+                     THEN REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')
+                          || SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1, 1)
+                     ELSE u.code_article || ''_''
+                   END
+                || ftm.file_type 
+                || ''_''
+                || lc.lang_code 
+                || CASE
+                     WHEN REGEXP_LIKE(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''.*[_\\-][0-9]\\.[^.]+$'')
+                    THEN ''_'' || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''[_\\-][0-9]\\.[^.]+$'')) - 1), ''_'', ''-'') || LOWER(REGEXP_SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), ''[_\\-][0-9]\\.[^.]+$''))
+                     ELSE ''_''
+                || REPLACE(SUBSTR(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1), 2, LENGTH(SUBSTR(u.document_name, LENGTH(REGEXP_SUBSTR(u.document_name, ''^([^_\\-]+)'', 1, 1, ''e'')) + 1)) - LENGTH(REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$'')) - 1), ''_'', ''-'') || ''_1'' || LOWER(REGEXP_SUBSTR(u.document_name, ''\\.[^.]+$''))
+                   END
             AS target_file,
             lc.lang_code,
             u.code_article
@@ -301,11 +340,11 @@ def main(session):
 
     session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.ZIPS_TRAITES;").collect()
     session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.COPIES_A_FAIRE;").collect()
-    session.sql(f"TRUNCATE TABLE AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES;").collect()
 
 
 
-    return f''Analyse terminée: {nb_new_zips} nouveaux ZIPs, {nb_docs} documents analysés, {nb_copies} copies créées dans le dossier {today_folder}''
+    skipped_msg = f'', {len(skipped_files)} fichiers ignorés (erreur): {[s[0] for s in skipped_files]}'' if skipped_files else ''''
+    return f''Analyse terminée: {nb_new_zips} nouveaux ZIPs, {nb_docs} documents analysés, {nb_copies} copies créées dans le dossier {today_folder}{skipped_msg}''
 ';
 
 
@@ -319,11 +358,13 @@ TRUNCATE TABLE AREA_SOPHIE.PUBLIC.ZIPS_TRAITES;
 TRUNCATE TABLE AREA_SOPHIE.PUBLIC.DOCUMENTS_LANGUES;
 
 REMOVE '@AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD/150080_Capture_d_écran_2025-12-09_095854.png';
-REMOVE @AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD PATTERN='.*\\.png';
+REMOVE @AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD PATTERN='[^/]+\.pdf';
 REMOVE @AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD PATTERN='.*\\.jpg';
 
 
 SELECT RELATIVE_PATH
-        FROM DIRECTORY('@AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD')
-        WHERE RELATIVE_PATH ILIKE '%440824%'
-
+        FROM DIRECTORY('@AREA_SOPHIE.PUBLIC.DOCUMENTS_PIM_TRAD');
+      
+SELECT 
+    REGEXP_LIKE('_notice_salt-relax-power_2022_1.pdf', '.*_[0-9]\.[^.]+$') AS test1,
+    REGEXP_LIKE('_notice_salt-relax-power_2022.pdf',   '.*_[0-9]\.[^.]+$') AS test2;

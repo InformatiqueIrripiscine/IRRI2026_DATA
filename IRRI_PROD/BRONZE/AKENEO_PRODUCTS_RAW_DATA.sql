@@ -1,0 +1,1 @@
+SELECT * FROM akeneo_products_raw_data WHERE SKU='429431'
